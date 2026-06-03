@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime as dt
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+
+DEFAULT_CONFIG = "/etc/raidmon/config.json"
+RAID_PROC_NAMES = {"aacraid"}
+STATUS_ORDER = {"OK": 0, "WARN": 1, "FAIL": 2}
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def run_command(args):
+    try:
+        p = subprocess.run(
+            args,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return {
+            "ok": p.returncode == 0,
+            "returncode": p.returncode,
+            "stdout": p.stdout,
+            "stderr": p.stderr,
+            "command": args,
+        }
+    except FileNotFoundError as e:
+        return {
+            "ok": False,
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(e),
+            "command": args,
+        }
+
+
+def require_root():
+    if os.geteuid() != 0:
+        print("ERROR: raidmon must be run via sudo/root.", file=sys.stderr)
+        sys.exit(2)
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def which_or_error(name):
+    path = shutil.which(name)
+    if not path:
+        raise RuntimeError(f"Required tool not found: {name}")
+    return path
+
+
+def read_file(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def discover_scsi_hosts():
+    hosts = {}
+    base = Path("/sys/class/scsi_host")
+    if not base.exists():
+        return hosts
+
+    for host_path in sorted(base.glob("host*")):
+        if not host_path.name.startswith("host"):
+            continue
+
+        info = {"host": host_path.name, "sysfs_path": str(host_path)}
+        for field in (
+            "proc_name",
+            "vendor",
+            "model",
+            "serial_number",
+            "driver_version",
+            "hba_bios_version",
+            "hba_kernel_version",
+            "hba_monitor_version",
+            "state",
+            "active_mode",
+            "supported_mode",
+            "unique_id",
+            "max_channel",
+            "max_id",
+        ):
+            value = read_file(host_path / field)
+            if value is not None:
+                info[field] = value
+
+        proc_name = info.get("proc_name")
+        if proc_name in RAID_PROC_NAMES:
+            hosts[host_path.name] = info
+
+    return hosts
+
+
+LSSCSI_RE = re.compile(
+    r"^\[(?P<host>\d+):(?P<channel>\d+):(?P<target>\d+):(?P<lun>\d+)\]\s+"
+    r"(?P<type>\S+)\s+"
+    r"(?P<rest>.*?)\s+"
+    r"(?P<block>/dev/\S+|-)\s+"
+    r"(?P<sg>/dev/sg\d+)\s*$"
+)
+
+
+def parse_lsscsi(output):
+    devices = []
+    for line in output.splitlines():
+        line = line.rstrip()
+        m = LSSCSI_RE.match(line)
+        if not m:
+            continue
+
+        data = m.groupdict()
+        rest = data.pop("rest").strip()
+
+        parts = rest.split()
+        vendor = None
+        model = None
+        revision = None
+
+        if len(parts) >= 2:
+            revision = parts[-1]
+            body = parts[:-1]
+            if body and body[0] in {"Adaptec", "ATA"}:
+                vendor = body[0]
+                model = " ".join(body[1:]) or None
+            else:
+                model = " ".join(body) or None
+
+        device = {
+            "line": line,
+            "host": int(data["host"]),
+            "channel": int(data["channel"]),
+            "target": int(data["target"]),
+            "lun": int(data["lun"]),
+            "type": data["type"],
+            "vendor": vendor,
+            "model": model,
+            "revision": revision,
+            "block_device": None if data["block"] == "-" else data["block"],
+            "sg_device": data["sg"],
+        }
+        devices.append(device)
+
+    return devices
+
+
+def get_lsscsi_devices(lsscsi_path):
+    result = run_command([lsscsi_path, "-g"])
+    return result, parse_lsscsi(result["stdout"])
+
+
+def normalize_wwn(value):
+    if not value:
+        return None
+    return re.sub(r"\s+", "", value).lower()
+
+
+def first_int(text):
+    if text is None:
+        return None
+    m = re.search(r"-?\d+", str(text))
+    return int(m.group(0)) if m else None
+
+
+def parse_capacity(value):
+    if not value:
+        return None
+    m = re.search(r"([\d,]+)\s+bytes", value)
+    if not m:
+        return None
+    return int(m.group(1).replace(",", ""))
+
+
+def parse_power_on_hours(raw):
+    if raw is None:
+        return None
+
+    text = str(raw).strip()
+
+    if text.isdigit():
+        return float(text)
+
+    m = re.match(r"(?P<h>\d+)h(?:\+(?P<m>\d+)m)?(?:\+(?P<s>[\d.]+)s)?", text)
+    if m:
+        hours = float(m.group("h"))
+        minutes = float(m.group("m") or 0)
+        seconds = float(m.group("s") or 0)
+        return hours + minutes / 60 + seconds / 3600
+
+    return None
+
+
+def parse_temperature(raw):
+    if raw is None:
+        return None
+    return first_int(raw)
+
+
+def split_smart_sections(output):
+    sections = {}
+    current = "preamble"
+    buf = []
+
+    for line in output.splitlines():
+        if line.startswith("=== START OF "):
+            sections[current] = "\n".join(buf).strip()
+            current = line.strip("= ").lower().replace(" ", "_")
+            buf = []
+        else:
+            buf.append(line)
+
+    sections[current] = "\n".join(buf).strip()
+    return sections
+
+
+ATTR_RE = re.compile(
+    r"^\s*(?P<id>\d+)\s+"
+    r"(?P<name>\S+)\s+"
+    r"(?P<flag>0x[0-9a-fA-F]+)\s+"
+    r"(?P<value>\d+)\s+"
+    r"(?P<worst>\d+)\s+"
+    r"(?P<thresh>\d+)\s+"
+    r"(?P<type>\S+)\s+"
+    r"(?P<updated>\S+)\s+"
+    r"(?P<when_failed>\S+)\s+"
+    r"(?P<raw>.+?)\s*$"
+)
+
+
+def parse_smart_attributes(output):
+    attrs_by_id = {}
+    attrs_by_name = {}
+    in_table = False
+
+    for line in output.splitlines():
+        if line.startswith("ID# ATTRIBUTE_NAME"):
+            in_table = True
+            continue
+
+        if not in_table:
+            continue
+
+        if not line.strip():
+            continue
+
+        m = ATTR_RE.match(line)
+        if not m:
+            if line.startswith("SMART Error Log") or line.startswith("SMART Self-test"):
+                break
+            continue
+
+        d = m.groupdict()
+        raw = d["raw"].strip()
+        item = {
+            "id": int(d["id"]),
+            "name": d["name"],
+            "flag": d["flag"],
+            "value": int(d["value"]),
+            "worst": int(d["worst"]),
+            "threshold": int(d["thresh"]),
+            "type": d["type"],
+            "updated": d["updated"],
+            "when_failed": None if d["when_failed"] == "-" else d["when_failed"],
+            "raw": raw,
+            "raw_int": first_int(raw),
+        }
+
+        attrs_by_id[str(item["id"])] = item
+        attrs_by_name[item["name"]] = item
+
+    return {"by_id": attrs_by_id, "by_name": attrs_by_name}
+
+
+def parse_key_values(section):
+    data = {}
+    for line in section.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower().replace(" ", "_")
+        value = value.strip()
+        if key:
+            data[key] = value
+    return data
+
+
+def parse_smartctl_output(output):
+    sections = split_smart_sections(output)
+    info = parse_key_values(sections.get("start_of_information_section", ""))
+
+    attrs = parse_smart_attributes(output)
+    by_name = attrs["by_name"]
+
+    health = None
+    m = re.search(r"SMART overall-health self-assessment test result:\s*(.+)", output)
+    if m:
+        health = m.group(1).strip()
+
+    ata_error_count = None
+    m = re.search(r"ATA Error Count:\s*(\d+)", output)
+    if m:
+        ata_error_count = int(m.group(1))
+
+    wwn = normalize_wwn(info.get("lu_wwn_device_id"))
+
+    power_raw = None
+    if "Power_On_Hours" in by_name:
+        power_raw = by_name["Power_On_Hours"]["raw"]
+
+    temp_raw = None
+    if "Temperature_Celsius" in by_name:
+        temp_raw = by_name["Temperature_Celsius"]["raw"]
+    elif "Airflow_Temperature_Cel" in by_name:
+        temp_raw = by_name["Airflow_Temperature_Cel"]["raw"]
+
+    parsed = {
+        "information": {
+            "device_model": info.get("device_model"),
+            "serial_number": info.get("serial_number"),
+            "wwn": wwn,
+            "firmware_version": info.get("firmware_version"),
+            "user_capacity": {
+                "raw": info.get("user_capacity"),
+                "bytes": parse_capacity(info.get("user_capacity")),
+            },
+            "sector_sizes": info.get("sector_sizes"),
+            "rotation_rate": info.get("rotation_rate"),
+            "form_factor": info.get("form_factor"),
+            "ata_version": info.get("ata_version_is"),
+            "sata_version": info.get("sata_version_is"),
+            "smart_support": {
+                "available": info.get("smart_support_is") == "Available - device has SMART capability",
+                "raw": info.get("smart_support_is"),
+            },
+        },
+        "health": health,
+        "general": parse_key_values(sections.get("start_of_read_smart_data_section", "")),
+        "attributes": attrs,
+        "ata_error_count": ata_error_count,
+        "power_on_hours": {
+            "raw": power_raw,
+            "hours": parse_power_on_hours(power_raw),
+        },
+        "temperature_celsius": {
+            "raw": temp_raw,
+            "value": parse_temperature(temp_raw),
+        },
+        "sections": sections,
+    }
+
+    return parsed
+
+
+def device_identifier(parsed, fallback_sg):
+    info = parsed.get("information", {})
+    return (
+        info.get("wwn")
+        or info.get("serial_number")
+        or fallback_sg
+    )
+
+
+def smartctl_collect(smartctl_path, sg_device):
+    result = run_command([smartctl_path, "-a", "-d", "sat", sg_device])
+    parsed = parse_smartctl_output(result["stdout"]) if result["stdout"] else {}
+    return {
+        "execution": {
+            "ok": result["ok"],
+            "returncode": result["returncode"],
+            "stderr": result["stderr"],
+            "command": result["command"],
+        },
+        "parsed": parsed,
+        "raw_smartctl_output": result["stdout"],
+    }
+
+
+def attr_raw_int(parsed, name):
+    try:
+        return parsed["attributes"]["by_name"][name]["raw_int"]
+    except KeyError:
+        return None
+
+
+def evaluate_device(smart_result):
+    status = "OK"
+    reasons = []
+
+    execution = smart_result.get("execution", {})
+
+    rc = execution.get("returncode", 0)
+    stdout = smart_result.get("raw_smartctl_output", "")
+
+    if not stdout.strip():
+        status = "FAIL"
+        reasons.append("no smartctl output")
+
+    elif rc & 0x03:
+        status = "FAIL"
+        reasons.append(f"smartctl rc={rc}")
+
+    parsed = smart_result.get("parsed", {})
+
+    health = parsed.get("health")
+    if health and health != "PASSED":
+        status = "FAIL"
+        reasons.append(f"SMART health is {health}")
+
+    pending = attr_raw_int(parsed, "Current_Pending_Sector")
+    offline = attr_raw_int(parsed, "Offline_Uncorrectable")
+    realloc = attr_raw_int(parsed, "Reallocated_Sector_Ct")
+    reported = attr_raw_int(parsed, "Reported_Uncorrect")
+    temp = parsed.get("temperature_celsius", {}).get("value")
+    ata_errors = parsed.get("ata_error_count")
+
+    if pending and pending > 0:
+        status = "FAIL"
+        reasons.append(f"Pending={pending}")
+
+    if offline and offline > 0:
+        status = "FAIL"
+        reasons.append(f"Offline={offline}")
+
+    warn_checks = [
+        ("Realloc", realloc),
+    ]
+
+    for label, value in warn_checks:
+        if value and value > 0:
+            if status != "FAIL":
+                status = "WARN"
+            reasons.append(f"{label}={value}")
+
+    if temp is not None:
+        if temp >= 55:
+            status = "FAIL"
+            reasons.append(f"Temp={temp}C")
+        elif temp >= 45 and status != "FAIL":
+            status = "WARN"
+            reasons.append(f"Temp={temp}C")
+
+    return status, reasons
+
+
+def build_config(config_path, force):
+    require_root()
+
+    config_file = Path(config_path)
+    if config_file.exists() and not force:
+        print(f"ERROR: {config_file} already exists", file=sys.stderr)
+        print("Use --force to overwrite", file=sys.stderr)
+        sys.exit(2)
+
+    tools = {
+        "smartctl": which_or_error("smartctl"),
+        "sg_map": which_or_error("sg_map"),
+        "lsscsi": which_or_error("lsscsi"),
+    }
+
+    controllers = discover_scsi_hosts()
+    lsscsi_result, lsscsi_devices = get_lsscsi_devices(tools["lsscsi"])
+
+    devices = {}
+
+    for host_name, controller in controllers.items():
+        host_no = int(host_name.replace("host", ""))
+        controller["logical_devices"] = []
+        controller["physical_devices"] = []
+
+        for dev in lsscsi_devices:
+            if dev["host"] != host_no:
+                continue
+
+            if dev["channel"] == 0:
+                controller["logical_devices"].append(dev)
+                continue
+
+            if not dev["sg_device"]:
+                continue
+
+            smart = smartctl_collect(tools["smartctl"], dev["sg_device"])
+            parsed = smart.get("parsed", {})
+            ident = device_identifier(parsed, dev["sg_device"])
+
+            device_entry = {
+                "controller": host_name,
+                "scsi": {
+                    "host": dev["host"],
+                    "channel": dev["channel"],
+                    "target": dev["target"],
+                    "lun": dev["lun"],
+                },
+                "paths": {
+                    "sg": dev["sg_device"],
+                    "block": dev["block_device"],
+                },
+                "lsscsi": dev,
+                "smartctl": {
+                    "device_type": "sat",
+                    "args": ["-a", "-d", "sat"],
+                },
+                "identity": {
+                    "id": ident,
+                    "wwn": parsed.get("information", {}).get("wwn"),
+                    "serial_number": parsed.get("information", {}).get("serial_number"),
+                    "model": parsed.get("information", {}).get("device_model"),
+                    "firmware_version": parsed.get("information", {}).get("firmware_version"),
+                },
+            }
+
+            devices[ident] = device_entry
+            controller["physical_devices"].append(ident)
+
+    config = {
+        "tools": tools,
+        "controllers": controllers,
+        "devices": devices,
+    }
+
+    save_json(config_file, config)
+    print(f"Config written: {config_file}")
+
+
+def discover_current_physical_devices(config):
+    lsscsi_result, lsscsi_devices = get_lsscsi_devices(config["tools"]["lsscsi"])
+
+    configured_hosts = {
+        int(h.replace("host", ""))
+        for h in config.get("controllers", {})
+        if h.startswith("host")
+    }
+
+    physical = []
+    logical = []
+
+    for dev in lsscsi_devices:
+        if dev["host"] not in configured_hosts:
+            continue
+        if dev["channel"] == 0:
+            logical.append(dev)
+        else:
+            physical.append(dev)
+
+    return lsscsi_result, physical, logical
+
+
+def collect(config_path):
+    require_root()
+
+    config = load_json(config_path)
+    result = {
+        "timestamp": utc_now(),
+        "raidmon_version": "0.1",
+        "host": {
+            "hostname": socket.gethostname(),
+            "kernel": platform.release(),
+            "system": platform.platform(),
+        },
+        "controllers": {},
+        "devices": {},
+        "unmanaged_devices": {},
+        "summary": {
+            "status": "OK",
+            "warnings": [],
+            "failures": [],
+        },
+    }
+
+    current_controllers = discover_scsi_hosts()
+    lsscsi_result, current_physical, current_logical = discover_current_physical_devices(config)
+
+    for host_name, cfg_controller in config.get("controllers", {}).items():
+        current = current_controllers.get(host_name)
+        if current is None:
+            status = "FAIL"
+            reasons = ["controller missing"]
+            current = {}
+        else:
+            status = "OK"
+            reasons = []
+
+        result["controllers"][host_name] = {
+            "status": status,
+            "reasons": reasons,
+            "configured": cfg_controller,
+            "current": current,
+            "logical_devices": [
+                d for d in current_logical if f"host{d['host']}" == host_name
+            ],
+        }
+
+    current_by_id = {}
+    current_smart_by_sg = {}
+
+    for dev in current_physical:
+        smart = smartctl_collect(config["tools"]["smartctl"], dev["sg_device"])
+        current_smart_by_sg[dev["sg_device"]] = smart
+        ident = device_identifier(smart.get("parsed", {}), dev["sg_device"])
+        current_by_id[ident] = {
+            "lsscsi": dev,
+            "smart": smart,
+        }
+
+    expected_ids = set(config.get("devices", {}).keys())
+    current_ids = set(current_by_id.keys())
+
+    for ident, cfg_device in config.get("devices", {}).items():
+        if ident not in current_by_id:
+            entry = {
+                "status": "FAIL",
+                "reasons": ["expected device missing"],
+                "configured": cfg_device,
+                "current": None,
+            }
+            result["devices"][ident] = entry
+            result["summary"]["failures"].append(f"{ident}: expected device missing")
+            continue
+
+        current = current_by_id[ident]
+        smart = current["smart"]
+        status, reasons = evaluate_device(smart)
+
+        entry = {
+            "status": status,
+            "reasons": reasons,
+            "configured": cfg_device,
+            "current": {
+                "lsscsi": current["lsscsi"],
+                "paths": {
+                    "sg": current["lsscsi"]["sg_device"],
+                    "block": current["lsscsi"]["block_device"],
+                },
+            },
+            "smart": smart,
+        }
+
+        result["devices"][ident] = entry
+
+        for reason in reasons:
+            if status == "FAIL":
+                result["summary"]["failures"].append(f"{ident}: {reason}")
+            elif status == "WARN":
+                result["summary"]["warnings"].append(f"{ident}: {reason}")
+
+    for ident in sorted(current_ids - expected_ids):
+        current = current_by_id[ident]
+        smart = current["smart"]
+        status, reasons = evaluate_device(smart)
+
+        if status == "OK":
+            status = "WARN"
+            reasons = ["unmanaged device detected"]
+        else:
+            reasons.insert(0, "unmanaged device detected")
+
+        result["unmanaged_devices"][ident] = {
+            "status": status,
+            "reasons": reasons,
+            "current": {
+                "lsscsi": current["lsscsi"],
+                "paths": {
+                    "sg": current["lsscsi"]["sg_device"],
+                    "block": current["lsscsi"]["block_device"],
+                },
+            },
+            "smart": smart,
+        }
+        result["summary"]["warnings"].append(f"{ident}: unmanaged device detected")
+
+    final = "OK"
+    if result["summary"]["warnings"]:
+        final = "WARN"
+    if result["summary"]["failures"]:
+        final = "FAIL"
+
+    result["summary"]["status"] = final
+    return result
+
+
+def short_device_line(ident, entry):
+    status = entry["status"]
+
+    if entry.get("current"):
+        sg = entry["current"]["paths"]["sg"].replace("/dev/", "")
+    else:
+        sg = entry["configured"]["paths"]["sg"].replace("/dev/", "")
+
+    smart = entry.get("smart", {})
+    parsed = smart.get("parsed", {})
+    info = parsed.get("information", {})
+
+    serial = (
+        info.get("serial_number")
+        or entry.get("configured", {}).get("identity", {}).get("serial_number")
+        or ident
+    )
+
+    temp = parsed.get("temperature_celsius", {}).get("value")
+    hours = parsed.get("power_on_hours", {}).get("hours")
+
+    temp_s = f"{temp}C" if temp is not None else "-"
+    hours_s = f"{int(hours)}h" if hours is not None else "-"
+
+    base = f"{status:<5} {sg:<4} {serial:<12} {temp_s:<5} {hours_s:<8}"
+
+    if status != "OK":
+        return base + "  " + " ".join(entry.get("reasons", []))
+
+    return base.rstrip()
+
+
+def print_collect(result):
+    for ident in sorted(result["devices"]):
+        print(short_device_line(ident, result["devices"][ident]))
+
+    for ident in sorted(result["unmanaged_devices"]):
+        entry = result["unmanaged_devices"][ident]
+        print(short_device_line(ident, entry))
+
+
+def print_check(result):
+    for ident in sorted(result["devices"]):
+        entry = result["devices"][ident]
+        if entry["status"] != "OK":
+            print(short_device_line(ident, entry))
+
+    for ident in sorted(result["unmanaged_devices"]):
+        print(short_device_line(ident, result["unmanaged_devices"][ident]))
+
+
+def exit_code(status):
+    return STATUS_ORDER.get(status, 2)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="raidmon")
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_build = sub.add_parser("build-config")
+    p_build.add_argument("--force", action="store_true")
+
+    p_collect = sub.add_parser("collect")
+    p_collect.add_argument("--json", action="store_true")
+
+    p_check = sub.add_parser("check")
+    p_check.add_argument("--json", action="store_true")
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "build-config":
+            build_config(args.config, args.force)
+            return 0
+
+        if args.command == "collect":
+            result = collect(args.config)
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print_collect(result)
+            return exit_code(result["summary"]["status"])
+
+        if args.command == "check":
+            result = collect(args.config)
+            if args.json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print_check(result)
+            return exit_code(result["summary"]["status"])
+
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as e:
+        print(f"ERROR: invalid JSON config: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
