@@ -40,6 +40,23 @@ Example:
 ```bash
 sudo apt install smartmontools sg3-utils lsscsi
 ```
+## Installation
+
+```bash
+sudo apt update
+sudo apt install build-essential git python3 smartmontools sg3-utils lsscsi
+
+git clone https://github.com/oa-evseev/raidmon.git
+cd raidmon
+
+sudo make install
+```
+
+Generate the initial configuration:
+
+```bash
+sudo raidmon build-config
+```
 
 ## Configuration
 
